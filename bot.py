@@ -1,8 +1,30 @@
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+
 TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", "10000"))
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"EHAN EARN BOT is running!")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_web_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.serve_forever()
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -21,37 +43,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - Help"
     )
 
+
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("💰 আপনার Balance: 0")
+
 
 async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🌍 International Quiz শীঘ্রই চালু হবে।")
 
+
 async def mining(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⛏️ Virtual Mining শুরু করার ব্যবস্থা করা হচ্ছে।")
+
 
 async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📋 বর্তমানে কোনো Task নেই।")
 
+
 async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👥 আপনার Referral system শীঘ্রই চালু হবে।")
+    await update.message.reply_text("👥 Referral system শীঘ্রই চালু হবে।")
+
 
 async def games(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🎮 Games শীঘ্রই চালু হবে।")
 
+
 async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("💸 Withdrawal system শীঘ্রই চালু হবে।")
+
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏆 Leaderboard শীঘ্রই চালু হবে।")
 
+
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📜 BOT RULES\n\n"
-        "• একাধিক fake account ব্যবহার করবেন না।\n"
+        "• Fake account ব্যবহার করবেন না।\n"
         "• প্রতারণামূলক কাজ করা যাবে না।\n"
         "• Withdrawal-এর আগে প্রয়োজনীয় শর্ত পূরণ করতে হবে।"
     )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -59,7 +91,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "যেকোনো সমস্যায় Admin-এর সাথে যোগাযোগ করুন।"
     )
 
+
 def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is missing.")
+
+    threading.Thread(target=start_web_server, daemon=True).start()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -76,6 +114,7 @@ def main():
 
     print("EHAN EARN BOT is running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
