@@ -25,7 +25,9 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
-            balance REAL DEFAULT 0
+            balance REAL DEFAULT 0,
+            referred_by INTEGER DEFAULT NULL,
+            referral_count INTEGER DEFAULT 0
         )
     """)
 
@@ -33,7 +35,7 @@ def init_db():
     conn.close()
 
 
-def add_user(user):
+def add_user(user, referred_by=None):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
@@ -47,15 +49,27 @@ def add_user(user):
     if not exists:
         cursor.execute(
             """
-            INSERT INTO users (user_id, username, first_name, balance)
-            VALUES (?, ?, ?, 0)
+            INSERT INTO users
+            (user_id, username, first_name, balance, referred_by)
+            VALUES (?, ?, ?, 0, ?)
             """,
             (
                 user.id,
                 user.username or "",
-                user.first_name or ""
+                user.first_name or "",
+                referred_by
             )
         )
+
+        if referred_by and referred_by != user.id:
+            cursor.execute(
+                """
+                UPDATE users
+                SET referral_count = referral_count + 1
+                WHERE user_id = ?
+                """,
+                (referred_by,)
+            )
 
     conn.commit()
     conn.close()
@@ -73,10 +87,22 @@ def get_balance(user_id):
     result = cursor.fetchone()
     conn.close()
 
-    if result:
-        return result[0]
+    return result[0] if result else 0
 
-    return 0
+
+def get_referral_count(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT referral_count FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+
+    result = cursor.fetchone()
+    conn.close()
+
+    return result[0] if result else 0
 
 
 # =========================
@@ -101,12 +127,20 @@ def start_web_server():
 
 
 # =========================
-# BOT COMMANDS
+# START
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    add_user(update.effective_user)
+    referred_by = None
+
+    if context.args:
+        try:
+            referred_by = int(context.args[0])
+        except ValueError:
+            referred_by = None
+
+    add_user(update.effective_user, referred_by)
 
     await update.message.reply_text(
         "🎉 Welcome to EHAN EARN BOT!\n\n"
@@ -125,6 +159,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# =========================
+# BALANCE
+# =========================
+
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     add_user(update.effective_user)
@@ -136,116 +174,27 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "🌍 International Quiz\n\n"
-        "Quiz system শীঘ্রই চালু হবে।"
-    )
-
-
-async def mining(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "⛏️ Virtual Mining\n\n"
-        "Mining system শীঘ্রই চালু হবে।"
-    )
-
-
-async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "📋 Available Tasks\n\n"
-        "বর্তমানে কোনো Task নেই।"
-    )
-
+# =========================
+# REFERRAL
+# =========================
 
 async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    add_user(update.effective_user)
+
+    user_id = update.effective_user.id
+    count = get_referral_count(user_id)
+
+    bot_username = context.bot.username
+
+    referral_link = f"https://t.me/{bot_username}?start={user_id}"
+
     await update.message.reply_text(
-        "👥 Referral System\n\n"
-        "Referral system শীঘ্রই চালু হবে।"
+        "👥 আপনার Referral System\n\n"
+        f"🔗 আপনার Referral Link:\n{referral_link}\n\n"
+        f"👤 Total Referrals: {count}\n\n"
+        "আপনার Referral Link অন্যদের সাথে শেয়ার করুন।"
     )
 
 
-async def games(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "🎮 Games\n\n"
-        "Games system শীঘ্রই চালু হবে।"
-    )
-
-
-async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "💸 Withdrawal\n\n"
-        "Withdrawal system শীঘ্রই চালু হবে।"
-    )
-
-
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "🏆 Leaderboard\n\n"
-        "Leaderboard শীঘ্রই চালু হবে।"
-    )
-
-
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "📜 BOT RULES\n\n"
-        "• Fake account ব্যবহার করবেন না।\n"
-        "• প্রতারণামূলক কাজ করা যাবে না।\n"
-        "• Withdrawal-এর আগে প্রয়োজনীয় শর্ত পূরণ করতে হবে।"
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "🆘 Help\n\n"
-        "যেকোনো সমস্যায় Admin-এর সাথে যোগাযোগ করুন।"
-    )
-
-
-# =========================
-# MAIN
-# =========================
-
-def main():
-
-    if not TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN environment variable is missing."
-        )
-
-    init_db()
-
-    threading.Thread(
-        target=start_web_server,
-        daemon=True
-    ).start()
-
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("quiz", quiz))
-    app.add_handler(CommandHandler("mining", mining))
-    app.add_handler(CommandHandler("tasks", tasks))
-    app.add_handler(CommandHandler("referral", referral))
-    app.add_handler(CommandHandler("games", games))
-    app.add_handler(CommandHandler("withdraw", withdraw))
-    app.add_handler(CommandHandler("leaderboard", leaderboard))
-    app.add_handler(CommandHandler("rules", rules))
-    app.add_handler(CommandHandler("help", help_command))
-
-    print("EHAN EARN BOT is running...")
-
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+# =================
