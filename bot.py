@@ -1,7 +1,7 @@
 import os
 import sqlite3
-import threading
 import random
+import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -16,90 +16,66 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
-
-# =========================================================
-# SETTINGS
-# =========================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
-
-# Render Environment Variables থেকে নেওয়া হবে
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 DB_FILE = "users.db"
 
-# Rewards
+# =========================
+# REWARDS
+# =========================
+
 MINING_REWARD = 5
 MINING_COOLDOWN_HOURS = 1
 
 REFERRAL_REWARD = 10
 QUIZ_REWARD = 5
 DAILY_REWARD = 10
-
-# Game
 GAME_REWARD = 10
 
-# Withdrawal
 MIN_WITHDRAWAL = 100
 
+WITHDRAW_METHODS = {
+    "binance": "Binance",
+    "bkash": "bKash",
+    "nagad": "Nagad",
+    "paypal": "PayPal",
+}
 
-# =========================================================
+
+# =========================
 # DATABASE
-# =========================================================
+# =========================
 
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
+def db():
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def column_exists(conn, table, column):
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    columns = [row["name"] for row in cur.fetchall()]
-    return column in columns
-
-
-def add_column_if_missing(conn, table, column, definition):
-
-    if not column_exists(conn, table, column):
-
-        conn.execute(
-            f"ALTER TABLE {table} ADD COLUMN "
-            f"{column} {definition}"
-        )
-
-
 def init_db():
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    # Users
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
             balance REAL DEFAULT 0,
-            referred_by INTEGER DEFAULT NULL,
+            referred_by INTEGER,
             referral_count INTEGER DEFAULT 0,
-            last_mining TEXT DEFAULT NULL
+            last_mining TEXT,
+            last_daily TEXT
         )
     """)
 
-    # পুরোনো database থাকলেও নতুন column যোগ হবে
-    add_column_if_missing(
-        conn,
-        "users",
-        "last_daily",
-        "TEXT DEFAULT NULL"
-    )
-
-    # Withdrawals
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS withdrawals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -111,8 +87,7 @@ def init_db():
         )
     """)
 
-    # Tasks
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
@@ -122,8 +97,7 @@ def init_db():
         )
     """)
 
-    # Task submissions
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS task_submissions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -133,8 +107,7 @@ def init_db():
         )
     """)
 
-    # Games
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS game_stats (
             user_id INTEGER PRIMARY KEY,
             wins INTEGER DEFAULT 0,
@@ -146,29 +119,38 @@ def init_db():
     conn.close()
 
 
-# =========================================================
+# =========================
 # USER
-# =========================================================
+# =========================
 
-def add_user(user, referred_by=None):
+def add_user(user, referral_id=None):
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute(
+    existing = conn.execute(
         "SELECT user_id FROM users WHERE user_id=?",
         (user.id,)
-    )
+    ).fetchone()
 
-    existing = cur.fetchone()
+    if existing:
 
-    if existing is None:
+        conn.execute("""
+            UPDATE users
+            SET username=?,
+                first_name=?
+            WHERE user_id=?
+        """, (
+            user.username or "",
+            user.first_name or "",
+            user.id
+        ))
 
-        # নিজের referral link নিজে ব্যবহার করতে পারবে না
-        if referred_by == user.id:
-            referred_by = None
+    else:
 
-        cur.execute("""
+        if referral_id == user.id:
+            referral_id = None
+
+        conn.execute("""
             INSERT INTO users
             (
                 user_id,
@@ -182,43 +164,27 @@ def add_user(user, referred_by=None):
             user.id,
             user.username or "",
             user.first_name or "",
-            referred_by
+            referral_id
         ))
 
-        # Referral reward
-        if referred_by:
+        if referral_id:
 
-            cur.execute(
+            ref_user = conn.execute(
                 "SELECT user_id FROM users WHERE user_id=?",
-                (referred_by,)
-            )
+                (referral_id,)
+            ).fetchone()
 
-            referrer_exists = cur.fetchone()
+            if ref_user:
 
-            if referrer_exists:
-
-                cur.execute("""
+                conn.execute("""
                     UPDATE users
                     SET referral_count = referral_count + 1,
                         balance = balance + ?
-                    WHERE user_id = ?
+                    WHERE user_id=?
                 """, (
                     REFERRAL_REWARD,
-                    referred_by
+                    referral_id
                 ))
-
-    else:
-
-        cur.execute("""
-            UPDATE users
-            SET username=?,
-                first_name=?
-            WHERE user_id=?
-        """, (
-            user.username or "",
-            user.first_name or "",
-            user.id
-        ))
 
     conn.commit()
     conn.close()
@@ -226,30 +192,29 @@ def add_user(user, referred_by=None):
 
 def get_balance(user_id):
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute(
+    row = conn.execute(
         "SELECT balance FROM users WHERE user_id=?",
         (user_id,)
-    )
-
-    result = cur.fetchone()
+    ).fetchone()
 
     conn.close()
 
-    return float(result["balance"]) if result else 0
+    if row:
+        return float(row["balance"])
+
+    return 0.0
 
 
 def add_balance(user_id, amount):
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute("""
+    conn.execute("""
         UPDATE users
         SET balance = balance + ?
-        WHERE user_id = ?
+        WHERE user_id=?
     """, (
         amount,
         user_id
@@ -259,79 +224,41 @@ def add_balance(user_id, amount):
     conn.close()
 
 
-def subtract_balance(user_id, amount):
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        UPDATE users
-        SET balance = balance - ?
-        WHERE user_id = ?
-          AND balance >= ?
-    """, (
-        amount,
-        user_id,
-        amount
-    ))
-
-    success = cur.rowcount > 0
-
-    conn.commit()
-    conn.close()
-
-    return success
-
-
-def get_referrals(user_id):
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT referral_count FROM users WHERE user_id=?",
-        (user_id,)
-    )
-
-    result = cur.fetchone()
-
-    conn.close()
-
-    return int(result["referral_count"]) if result else 0
-
-
-# =========================================================
+# =========================
 # ADMIN
-# =========================================================
+# =========================
 
 def is_admin(user_id):
+
     return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 
-# =========================================================
+# =========================
 # RENDER HEALTH SERVER
-# =========================================================
+# =========================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
         self.send_response(200)
+
         self.send_header(
-            "Content-type",
+            "Content-Type",
             "text/plain"
         )
+
         self.end_headers()
 
         self.wfile.write(
             b"EHAN EARN BOT is running!"
         )
 
-    def log_message(self, format, *args):
-        return
+    def log_message(self, *args):
+        pass
 
 
-def start_web_server():
+def health_server():
 
     server = HTTPServer(
         ("0.0.0.0", PORT),
@@ -341,50 +268,55 @@ def start_web_server():
     server.serve_forever()
 
 
-# =========================================================
+# =========================
 # START
-# =========================================================
+# =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    referred_by = None
+    referral_id = None
 
     if context.args:
 
         try:
-            referred_by = int(context.args[0])
+            referral_id = int(context.args[0])
         except ValueError:
-            referred_by = None
+            referral_id = None
 
     add_user(
         update.effective_user,
-        referred_by
+        referral_id
     )
 
     await update.message.reply_text(
         "🎉 Welcome to EHAN EARN BOT!\n\n"
-        "আপনার অ্যাকাউন্ট তৈরি হয়েছে।\n\n"
+        "আপনার account তৈরি/updated হয়েছে।\n\n"
+
         "📌 MAIN MENU\n\n"
-        "💰 /balance - Balance\n"
-        "⛏️ /mining - Mining\n"
-        "🎁 /daily - Daily Bonus\n"
-        "🌍 /quiz - Quiz\n"
-        "📋 /tasks - Tasks\n"
-        "👥 /referral - Referral\n"
-        "🎮 /games - Games\n"
-        "🏆 /leaderboard - Leaderboard\n"
-        "💸 /withdraw - Withdrawal\n"
-        "🆔 /myid - My ID\n"
-        "📜 /rules - Rules\n"
-        "🆘 /help - Help"
+
+        "💰 /balance\n"
+        "⛏️ /mining\n"
+        "🎁 /daily\n"
+        "🌍 /quiz\n"
+        "📋 /tasks\n"
+        "👥 /referral\n"
+        "🎮 /games\n"
+        "🏆 /leaderboard\n"
+        "💸 /withdraw\n"
+        "🆔 /myid\n"
+        "📜 /rules\n"
+        "🆘 /help"
     )
 
 
-# =========================================================
+# =========================
 # BALANCE
-# =========================================================
+# =========================
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def balance_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     add_user(update.effective_user)
 
@@ -398,76 +330,89 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# =========================================================
+# =========================
 # REFERRAL
-# =========================================================
+# =========================
 
-async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def referral(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     add_user(update.effective_user)
 
-    user_id = update.effective_user.id
+    conn = db()
 
-    count = get_referrals(user_id)
+    row = conn.execute("""
+        SELECT referral_count
+        FROM users
+        WHERE user_id=?
+    """, (
+        update.effective_user.id,
+    )).fetchone()
+
+    conn.close()
+
+    count = row["referral_count"] if row else 0
 
     bot_username = context.bot.username
 
     link = (
         f"https://t.me/"
         f"{bot_username}"
-        f"?start={user_id}"
+        f"?start={update.effective_user.id}"
     )
 
     await update.message.reply_text(
         "👥 REFERRAL SYSTEM\n\n"
-        f"🔗 আপনার Referral Link:\n"
+
+        f"🔗 Your Referral Link:\n"
         f"{link}\n\n"
+
         f"👤 Total Referrals: {count}\n"
+
         f"🎁 প্রতি নতুন Referral: "
-        f"+{REFERRAL_REWARD} Points\n\n"
-        "আপনার লিংক বন্ধুদের সাথে শেয়ার করুন।"
+        f"+{REFERRAL_REWARD} Points"
     )
 
 
-# =========================================================
+# =========================
 # MINING
-# =========================================================
+# =========================
 
-async def mining(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def mining(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user_id = update.effective_user.id
 
     add_user(update.effective_user)
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute(
-        "SELECT last_mining FROM users WHERE user_id=?",
-        (user_id,)
-    )
-
-    result = cur.fetchone()
-
-    last_mining = (
-        result["last_mining"]
-        if result
-        else None
-    )
+    row = conn.execute("""
+        SELECT last_mining
+        FROM users
+        WHERE user_id=?
+    """, (
+        user_id,
+    )).fetchone()
 
     now = datetime.utcnow()
 
-    if last_mining:
+    if row and row["last_mining"]:
 
         try:
 
-            last_time = datetime.fromisoformat(
-                last_mining
-            )
-
             next_time = (
-                last_time +
-                timedelta(hours=MINING_COOLDOWN_HOURS)
+                datetime.fromisoformat(
+                    row["last_mining"]
+                )
+                +
+                timedelta(
+                    hours=MINING_COOLDOWN_HOURS
+                )
             )
 
             if now < next_time:
@@ -475,26 +420,27 @@ async def mining(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 remaining = next_time - now
 
                 minutes = int(
-                    remaining.total_seconds() // 60
-                )
-
-                await update.message.reply_text(
-                    "⛏️ MINING COOLDOWN\n\n"
-                    f"⏳ আবার Mining করতে "
-                    f"{minutes} মিনিট অপেক্ষা করুন।"
+                    remaining.total_seconds() / 60
                 )
 
                 conn.close()
+
+                await update.message.reply_text(
+                    "⏳ MINING COOLDOWN\n\n"
+                    f"আবার Mining করতে "
+                    f"{minutes} মিনিট অপেক্ষা করুন।"
+                )
+
                 return
 
         except Exception:
             pass
 
-    cur.execute("""
+    conn.execute("""
         UPDATE users
         SET balance = balance + ?,
             last_mining = ?
-        WHERE user_id = ?
+        WHERE user_id=?
     """, (
         MINING_REWARD,
         now.isoformat(),
@@ -504,75 +450,60 @@ async def mining(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    new_balance = get_balance(user_id)
-
     await update.message.reply_text(
         "⛏️ MINING SUCCESSFUL!\n\n"
         f"🎁 Reward: +{MINING_REWARD} Points\n"
-        f"💰 Balance: {new_balance:.2f} Points\n\n"
+        f"💰 Balance: {get_balance(user_id):.2f} Points\n\n"
         f"⏳ আবার Mining করতে "
         f"{MINING_COOLDOWN_HOURS} ঘণ্টা পরে আসুন।"
     )
 
 
-# =========================================================
-# DAILY BONUS
-# =========================================================
+# =========================
+# DAILY
+# =========================
 
-async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def daily(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user_id = update.effective_user.id
 
     add_user(update.effective_user)
 
-    conn = get_db()
-    cur = conn.cursor()
+    today = datetime.utcnow().date().isoformat()
 
-    cur.execute(
-        "SELECT last_daily FROM users WHERE user_id=?",
-        (user_id,)
-    )
+    conn = db()
 
-    result = cur.fetchone()
+    row = conn.execute("""
+        SELECT last_daily
+        FROM users
+        WHERE user_id=?
+    """, (
+        user_id,
+    )).fetchone()
 
-    last_daily = (
-        result["last_daily"]
-        if result
-        else None
-    )
+    if row and row["last_daily"] == today:
 
-    today = datetime.utcnow().date()
+        conn.close()
 
-    if last_daily:
+        await update.message.reply_text(
+            "🎁 DAILY BONUS\n\n"
+            "আপনি আজকের bonus ইতিমধ্যে নিয়েছেন।\n"
+            "আগামীকাল আবার নিতে পারবেন।"
+        )
 
-        try:
+        return
 
-            last_date = datetime.fromisoformat(
-                last_daily
-            ).date()
-
-            if last_date == today:
-
-                await update.message.reply_text(
-                    "🎁 DAILY BONUS\n\n"
-                    "আপনি আজকের Daily Bonus ইতিমধ্যে নিয়েছেন।\n"
-                    "আগামীকাল আবার নিতে পারবেন।"
-                )
-
-                conn.close()
-                return
-
-        except Exception:
-            pass
-
-    cur.execute("""
+    conn.execute("""
         UPDATE users
         SET balance = balance + ?,
             last_daily = ?
-        WHERE user_id = ?
+        WHERE user_id=?
     """, (
         DAILY_REWARD,
-        datetime.utcnow().isoformat(),
+        today,
         user_id
     ))
 
@@ -583,103 +514,81 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎁 DAILY BONUS RECEIVED!\n\n"
         f"+{DAILY_REWARD} Points\n\n"
         f"💰 Balance: "
-        f"{get_balance(user_id):.2f} Points\n\n"
-        "আগামীকাল আবার Daily Bonus নিতে পারবেন।"
+        f"{get_balance(user_id):.2f} Points"
     )
 
 
-# =========================================================
+# =========================
 # QUIZ
-# =========================================================
+# =========================
 
 QUIZ_DATA = [
 
-    {
-        "question": "🌍 What is the capital of Bangladesh?",
-        "options": [
-            "Dhaka",
-            "Chattogram",
-            "Rajshahi",
-            "Sylhet"
-        ],
-        "answer": 0
-    },
+    (
+        "🌍 What is the capital of Bangladesh?",
+        ["Dhaka", "Chattogram", "Rajshahi", "Sylhet"],
+        0
+    ),
 
-    {
-        "question": "🌍 Which planet is known as the Red Planet?",
-        "options": [
-            "Earth",
-            "Mars",
-            "Jupiter",
-            "Venus"
-        ],
-        "answer": 1
-    },
+    (
+        "🔴 Which planet is known as the Red Planet?",
+        ["Earth", "Mars", "Jupiter", "Venus"],
+        1
+    ),
 
-    {
-        "question": "🌍 How many days are there in a week?",
-        "options": [
-            "5",
-            "6",
-            "7",
-            "8"
-        ],
-        "answer": 2
-    },
+    (
+        "📅 How many days are there in a week?",
+        ["5", "6", "7", "8"],
+        2
+    ),
 
-    {
-        "question": "🌍 Which is the largest ocean?",
-        "options": [
-            "Atlantic Ocean",
-            "Indian Ocean",
-            "Pacific Ocean",
-            "Arctic Ocean"
-        ],
-        "answer": 2
-    },
+    (
+        "🌊 Which is the largest ocean?",
+        ["Atlantic", "Indian", "Pacific", "Arctic"],
+        2
+    ),
 
-    {
-        "question": "🌍 How many continents are there?",
-        "options": [
-            "5",
-            "6",
-            "7",
-            "8"
-        ],
-        "answer": 2
-    }
+    (
+        "🌍 How many continents are there?",
+        ["5", "6", "7", "8"],
+        2
+    )
 
 ]
 
 
-async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def quiz(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     add_user(update.effective_user)
 
-    item = random.choice(QUIZ_DATA)
+    question, options, answer = random.choice(
+        QUIZ_DATA
+    )
 
-    context.user_data["quiz_answer"] = item["answer"]
+    context.user_data["quiz_answer"] = answer
 
-    letters = ["A", "B", "C", "D"]
+    keyboard = []
 
-    buttons = []
+    for i, option in enumerate(options):
 
-    for i, option in enumerate(item["options"]):
-
-        buttons.append([
+        keyboard.append([
             InlineKeyboardButton(
-                f"{letters[i]}) {option}",
-                callback_data=f"quiz_{i}"
+                f"{chr(65+i)}) {option}",
+                callback_data=f"quiz:{i}"
             )
         ])
 
-    keyboard = InlineKeyboardMarkup(buttons)
-
     await update.message.reply_text(
         "🌍 INTERNATIONAL QUIZ\n\n"
-        f"{item['question']}\n\n"
-        "সঠিক উত্তরটি নির্বাচন করুন 👇",
-        reply_markup=keyboard
+        f"{question}\n\n"
+        "সঠিক উত্তর নির্বাচন করুন 👇",
+
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        )
     )
 
 
@@ -701,26 +610,18 @@ async def quiz_answer(
 
         return
 
-    try:
+    selected = int(
+        query.data.split(":")[1]
+    )
 
-        selected = int(
-            query.data.split("_")[1]
-        )
-
-    except Exception:
-
-        await query.edit_message_text(
-            "❌ Quiz error। আবার /quiz দিন।"
-        )
-
-        return
-
-    correct = context.user_data["quiz_answer"]
+    correct = context.user_data.pop(
+        "quiz_answer"
+    )
 
     if selected == correct:
 
         add_balance(
-            update.effective_user.id,
+            query.from_user.id,
             QUIZ_REWARD
         )
 
@@ -728,8 +629,7 @@ async def quiz_answer(
             "🎉 সঠিক উত্তর!\n\n"
             f"🎁 Reward: +{QUIZ_REWARD} Points\n"
             f"💰 Balance: "
-            f"{get_balance(update.effective_user.id):.2f} Points\n\n"
-            "👉 নতুন প্রশ্নের জন্য /quiz দিন।"
+            f"{get_balance(query.from_user.id):.2f} Points"
         )
 
     else:
@@ -739,31 +639,26 @@ async def quiz_answer(
             "আবার চেষ্টা করতে /quiz দিন।"
         )
 
-    context.user_data.pop(
-        "quiz_answer",
-        None
-    )
 
-
-# =========================================================
+# =========================
 # TASKS
-# =========================================================
+# =========================
 
-async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tasks(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     add_user(update.effective_user)
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute("""
+    rows = conn.execute("""
         SELECT id, title, description, reward
         FROM tasks
         WHERE active=1
         ORDER BY id DESC
-    """)
-
-    rows = cur.fetchall()
+    """).fetchall()
 
     conn.close()
 
@@ -771,8 +666,7 @@ async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             "📋 AVAILABLE TASKS\n\n"
-            "বর্তমানে কোনো Task নেই।\n\n"
-            "Admin নতুন Task যোগ করলে এখানে দেখা যাবে।"
+            "বর্তমানে কোনো Task নেই।"
         )
 
         return
@@ -786,7 +680,7 @@ async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📌 {row['title']}\n"
             f"📝 {row['description']}\n"
             f"🎁 Reward: {row['reward']:.2f} Points\n"
-            f"👉 Complete করতে: /done {row['id']}\n\n"
+            f"👉 /done {row['id']}\n\n"
         )
 
     await update.message.reply_text(text)
@@ -802,7 +696,7 @@ async def done_task(
     if not context.args:
 
         await update.message.reply_text(
-            "❗ ব্যবহার:\n"
+            "ব্যবহার:\n"
             "/done TASK_ID"
         )
 
@@ -822,16 +716,15 @@ async def done_task(
 
     user_id = update.effective_user.id
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute("""
-        SELECT id, title
+    task = conn.execute("""
+        SELECT *
         FROM tasks
         WHERE id=? AND active=1
-    """, (task_id,))
-
-    task = cur.fetchone()
+    """, (
+        task_id,
+    )).fetchone()
 
     if not task:
 
@@ -843,31 +736,35 @@ async def done_task(
 
         return
 
-    cur.execute("""
+    already = conn.execute("""
         SELECT id
         FROM task_submissions
-        WHERE user_id=? AND task_id=?
-          AND status IN ('Pending', 'Approved')
+        WHERE user_id=?
+        AND task_id=?
+        AND status IN ('Pending','Approved')
     """, (
         user_id,
         task_id
-    ))
-
-    already = cur.fetchone()
+    )).fetchone()
 
     if already:
 
         conn.close()
 
         await update.message.reply_text(
-            "⚠️ এই Task আপনি ইতিমধ্যে submit করেছেন।"
+            "⚠️ এই Task আপনি আগেই submit করেছেন।"
         )
 
         return
 
-    cur.execute("""
+    conn.execute("""
         INSERT INTO task_submissions
-        (user_id, task_id, status, created_at)
+        (
+            user_id,
+            task_id,
+            status,
+            created_at
+        )
         VALUES (?, ?, 'Pending', ?)
     """, (
         user_id,
@@ -879,39 +776,43 @@ async def done_task(
     conn.close()
 
     await update.message.reply_text(
-        "✅ Task Submission Received!\n\n"
+        "✅ TASK SUBMITTED\n\n"
         f"📌 Task: {task['title']}\n"
         "⏳ Status: Pending\n\n"
-        "Admin approve করলে Reward Balance-এ যোগ হবে।"
+        "Admin approve করলে reward যোগ হবে।"
     )
 
 
-# =========================================================
+# =========================
 # GAMES
-# =========================================================
+# =========================
 
-async def games(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def games(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await update.message.reply_text(
         "🎮 GAMES\n\n"
         "🎯 Number Guess Game\n\n"
-        "১ থেকে ৫-এর মধ্যে একটি সংখ্যা guess করুন।\n"
-        "ব্যবহার করুন:\n\n"
+        "১ থেকে ৫-এর মধ্যে একটি সংখ্যা guess করুন।\n\n"
+        "উদাহরণ:\n"
         "/guess 3\n\n"
-        f"🎁 জিতলে +{GAME_REWARD} Points"
+        f"🎁 Win করলে +{GAME_REWARD} Points"
     )
 
 
-async def guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def guess(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     add_user(update.effective_user)
 
     if not context.args:
 
         await update.message.reply_text(
-            "🎯 ১ থেকে ৫-এর মধ্যে একটি সংখ্যা দিন।\n\n"
-            "উদাহরণ:\n"
-            "/guess 3"
+            "/guess 1 থেকে 5"
         )
 
         return
@@ -923,7 +824,7 @@ async def guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
 
         await update.message.reply_text(
-            "❌ শুধু ১ থেকে ৫-এর সংখ্যা দিন।"
+            "❌ ১ থেকে ৫-এর সংখ্যা দিন।"
         )
 
         return
@@ -931,83 +832,84 @@ async def guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if number < 1 or number > 5:
 
         await update.message.reply_text(
-            "❌ সংখ্যা অবশ্যই ১ থেকে ৫-এর মধ্যে হতে হবে।"
+            "❌ সংখ্যা ১ থেকে ৫-এর মধ্যে হতে হবে।"
         )
 
         return
 
+    user_id = update.effective_user.id
+
     winning = random.randint(1, 5)
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute("""
-        INSERT INTO game_stats(user_id, wins, games)
+    conn.execute("""
+        INSERT INTO game_stats
+        (
+            user_id,
+            wins,
+            games
+        )
         VALUES (?, 0, 1)
+
         ON CONFLICT(user_id)
         DO UPDATE SET games=games+1
     """, (
-        update.effective_user.id,
+        user_id,
     ))
 
     if number == winning:
 
-        cur.execute("""
+        conn.execute("""
             UPDATE game_stats
             SET wins=wins+1
             WHERE user_id=?
         """, (
-            update.effective_user.id,
+            user_id,
         ))
 
-        conn.commit()
-        conn.close()
+    conn.commit()
+    conn.close()
+
+    if number == winning:
 
         add_balance(
-            update.effective_user.id,
+            user_id,
             GAME_REWARD
         )
 
         await update.message.reply_text(
             "🎉 YOU WIN!\n\n"
             f"🎯 Number: {winning}\n"
-            f"🎁 Reward: +{GAME_REWARD} Points\n"
-            f"💰 Balance: "
-            f"{get_balance(update.effective_user.id):.2f} Points"
+            f"🎁 +{GAME_REWARD} Points\n"
+            f"💰 Balance: {get_balance(user_id):.2f}"
         )
 
     else:
 
-        conn.commit()
-        conn.close()
-
         await update.message.reply_text(
             "😔 You Lost!\n\n"
-            f"🎯 Correct Number: {winning}\n\n"
-            "আবার চেষ্টা করতে /games দিন।"
+            f"🎯 Correct Number: {winning}"
         )
 
 
-# =========================================================
+# =========================
 # LEADERBOARD
-# =========================================================
+# =========================
 
 async def leaderboard(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute("""
+    rows = conn.execute("""
         SELECT first_name, username, balance
         FROM users
         ORDER BY balance DESC
         LIMIT 10
-    """)
-
-    rows = cur.fetchall()
+    """).fetchall()
 
     conn.close()
 
@@ -1037,9 +939,9 @@ async def leaderboard(
     await update.message.reply_text(text)
 
 
-# =========================================================
-# WITHDRAW
-# =========================================================
+# =========================
+# WITHDRAWAL MENU
+# =========================
 
 async def withdraw(
     update: Update,
@@ -1048,24 +950,88 @@ async def withdraw(
 
     add_user(update.effective_user)
 
-    balance_amount = get_balance(
-        update.effective_user.id
-    )
+    user_id = update.effective_user.id
+
+    keyboard = [
+
+        [
+            InlineKeyboardButton(
+                "🟡 Binance",
+                callback_data="wd:Binance"
+            ),
+
+            InlineKeyboardButton(
+                "🟢 bKash",
+                callback_data="wd:bKash"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🔴 Nagad",
+                callback_data="wd:Nagad"
+            ),
+
+            InlineKeyboardButton(
+                "🔵 PayPal",
+                callback_data="wd:PayPal"
+            )
+        ]
+
+    ]
 
     await update.message.reply_text(
+
         "💸 WITHDRAWAL\n\n"
+
         f"💰 আপনার Balance: "
-        f"{balance_amount:.2f} Points\n\n"
-        f"Minimum Withdrawal: "
+        f"{get_balance(user_id):.2f} Points\n\n"
+
+        f"🔻 Minimum Withdrawal: "
         f"{MIN_WITHDRAWAL} Points\n\n"
-        "Request করার format:\n"
-        "/withdraw AMOUNT METHOD ACCOUNT\n\n"
-        "উদাহরণ:\n"
-        "/withdraw 100 bKash 017XXXXXXXX"
+
+        "Payment Method নির্বাচন করুন 👇",
+
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        )
     )
 
 
-async def create_withdrawal(
+async def withdrawal_method(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    method = query.data.split(":")[1]
+
+    await query.message.reply_text(
+
+        f"✅ Selected Payment Method: {method}\n\n"
+
+        "Withdrawal request করতে লিখুন:\n\n"
+
+        f"/requestwithdraw "
+        f"{MIN_WITHDRAWAL} "
+        f"{method} "
+        f"YOUR_ACCOUNT\n\n"
+
+        "উদাহরণ:\n"
+
+        f"/requestwithdraw "
+        f"100 {method} YOUR_ACCOUNT"
+    )
+
+
+# =========================
+# CREATE WITHDRAWAL
+# =========================
+
+async def request_withdraw(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1075,17 +1041,26 @@ async def create_withdrawal(
     if len(context.args) < 3:
 
         await update.message.reply_text(
+
             "❗ সঠিক Format:\n\n"
-            "/withdraw AMOUNT METHOD ACCOUNT\n\n"
-            "উদাহরণ:\n"
-            "/withdraw 100 bKash 017XXXXXXXX"
+
+            "/requestwithdraw "
+            "AMOUNT METHOD ACCOUNT\n\n"
+
+            "Methods:\n"
+            "Binance\n"
+            "bKash\n"
+            "Nagad\n"
+            "PayPal"
         )
 
         return
 
     try:
 
-        amount = float(context.args[0])
+        amount = float(
+            context.args[0]
+        )
 
     except ValueError:
 
@@ -1095,8 +1070,31 @@ async def create_withdrawal(
 
         return
 
-    method = context.args[1]
-    account = " ".join(context.args[2:])
+    method_input = context.args[1].lower()
+
+    method_map = {
+        "binance": "Binance",
+        "bkash": "bKash",
+        "nagad": "Nagad",
+        "paypal": "PayPal"
+    }
+
+    if method_input not in method_map:
+
+        await update.message.reply_text(
+            "❌ Payment Method সঠিক নয়।\n\n"
+            "Binance / bKash / Nagad / PayPal"
+        )
+
+        return
+
+    method = method_map[
+        method_input
+    ]
+
+    account = " ".join(
+        context.args[2:]
+    )
 
     user_id = update.effective_user.id
 
@@ -1109,30 +1107,38 @@ async def create_withdrawal(
 
         return
 
-    balance_amount = get_balance(user_id)
+    conn = db()
 
-    if balance_amount < amount:
+    row = conn.execute("""
+        SELECT balance
+        FROM users
+        WHERE user_id=?
+    """, (
+        user_id,
+    )).fetchone()
+
+    if not row or row["balance"] < amount:
+
+        conn.close()
 
         await update.message.reply_text(
             "❌ আপনার Balance যথেষ্ট নয়।\n\n"
-            f"Balance: {balance_amount:.2f}"
+            f"💰 Balance: "
+            f"{get_balance(user_id):.2f}"
         )
 
         return
 
-    # টাকা কেটে Pending রাখা হবে
-    if not subtract_balance(user_id, amount):
+    conn.execute("""
+        UPDATE users
+        SET balance=balance-?
+        WHERE user_id=?
+    """, (
+        amount,
+        user_id
+    ))
 
-        await update.message.reply_text(
-            "❌ Withdrawal তৈরি করা যায়নি।"
-        )
-
-        return
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
+    cursor = conn.execute("""
         INSERT INTO withdrawals
         (
             user_id,
@@ -1151,27 +1157,33 @@ async def create_withdrawal(
         datetime.utcnow().isoformat()
     ))
 
-    withdrawal_id = cur.lastrowid
+    withdrawal_id = cursor.lastrowid
 
     conn.commit()
     conn.close()
 
     await update.message.reply_text(
+
         "✅ WITHDRAWAL REQUEST CREATED\n\n"
+
         f"🆔 Request ID: {withdrawal_id}\n"
         f"💰 Amount: {amount:.2f} Points\n"
         f"💳 Method: {method}\n"
         f"📱 Account: {account}\n"
         "⏳ Status: Pending\n\n"
-        "Admin review করার পর request process হবে।"
+
+        "Admin review করার পর payment process হবে।"
     )
 
 
-# =========================================================
+# =========================
 # MY ID
-# =========================================================
+# =========================
 
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def myid(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await update.message.reply_text(
         "🆔 আপনার Telegram User ID:\n\n"
@@ -1179,28 +1191,33 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# =========================================================
+# =========================
 # RULES
-# =========================================================
+# =========================
 
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rules(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await update.message.reply_text(
+
         "📜 EHAN EARN BOT RULES\n\n"
+
         "1️⃣ Fake account ব্যবহার করা যাবে না।\n"
         "2️⃣ Multiple account abuse করা যাবে না।\n"
         "3️⃣ Referral abuse করা যাবে না।\n"
-        "4️⃣ কোনো প্রতারণামূলক কাজ করা যাবে না।\n"
-        "5️⃣ Task fraud করা যাবে না।\n"
-        "6️⃣ Withdrawal-এর প্রয়োজনীয় শর্ত পূরণ করতে হবে।\n\n"
-        "⚠️ Points-এর cash value বা withdrawal "
-        "শুধু official system-এর শর্ত অনুযায়ী হবে।"
+        "4️⃣ Task fraud করা যাবে না।\n"
+        "5️⃣ Withdrawal request যাচাই করা হবে।\n\n"
+
+        "⚠️ Points-এর cash value এবং withdrawal "
+        "official system/rules অনুযায়ী হবে।"
     )
 
 
-# =========================================================
+# =========================
 # HELP
-# =========================================================
+# =========================
 
 async def help_command(
     update: Update,
@@ -1208,31 +1225,33 @@ async def help_command(
 ):
 
     await update.message.reply_text(
+
         "🆘 EHAN EARN BOT HELP\n\n"
-        "/start — Start\n"
-        "/balance — Balance\n"
-        "/mining — Mining\n"
-        "/daily — Daily Bonus\n"
-        "/quiz — Quiz\n"
-        "/tasks — Tasks\n"
-        "/done ID — Submit Task\n"
-        "/referral — Referral\n"
-        "/games — Games\n"
-        "/guess 3 — Guess Game\n"
-        "/leaderboard — Leaderboard\n"
-        "/withdraw — Withdrawal Info\n"
-        "/withdraw 100 bKash 017XXXXXXXX\n"
-        "/myid — Telegram ID\n"
-        "/rules — Rules\n"
-        "/help — Help"
+
+        "/start\n"
+        "/balance\n"
+        "/mining\n"
+        "/daily\n"
+        "/quiz\n"
+        "/tasks\n"
+        "/done ID\n"
+        "/referral\n"
+        "/games\n"
+        "/guess 3\n"
+        "/leaderboard\n"
+        "/withdraw\n"
+        "/requestwithdraw 100 bKash 017XXXXXXXX\n"
+        "/myid\n"
+        "/rules\n"
+        "/help"
     )
 
 
-# =========================================================
+# =========================
 # ADMIN STATS
-# =========================================================
+# =========================
 
-async def admin_stats(
+async def adminstats(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1240,66 +1259,51 @@ async def admin_stats(
     if not is_admin(update.effective_user.id):
 
         await update.message.reply_text(
-            "❌ আপনি Admin নন।"
+            "❌ Admin only."
         )
 
         return
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute(
+    users = conn.execute(
         "SELECT COUNT(*) AS total FROM users"
-    )
+    ).fetchone()["total"]
 
-    total_users = cur.fetchone()["total"]
+    points = conn.execute(
+        "SELECT COALESCE(SUM(balance),0) AS total FROM users"
+    ).fetchone()["total"]
 
-    cur.execute(
-        "SELECT SUM(balance) AS total FROM users"
-    )
-
-    total_balance = (
-        cur.fetchone()["total"]
-        or 0
-    )
-
-    cur.execute("""
+    withdrawals = conn.execute("""
         SELECT COUNT(*) AS total
         FROM withdrawals
         WHERE status='Pending'
-    """)
+    """).fetchone()["total"]
 
-    pending_withdrawals = (
-        cur.fetchone()["total"]
-    )
-
-    cur.execute("""
+    tasks_count = conn.execute("""
         SELECT COUNT(*) AS total
         FROM task_submissions
         WHERE status='Pending'
-    """)
-
-    pending_tasks = (
-        cur.fetchone()["total"]
-    )
+    """).fetchone()["total"]
 
     conn.close()
 
     await update.message.reply_text(
+
         "👨‍💻 ADMIN STATISTICS\n\n"
-        f"👥 Total Users: {total_users}\n"
-        f"💰 Total Points: {total_balance:.2f}\n"
-        f"💸 Pending Withdrawals: "
-        f"{pending_withdrawals}\n"
-        f"📋 Pending Tasks: {pending_tasks}"
+
+        f"👥 Users: {users}\n"
+        f"💰 Total Points: {points:.2f}\n"
+        f"💸 Pending Withdrawals: {withdrawals}\n"
+        f"📋 Pending Tasks: {tasks_count}"
     )
 
 
-# =========================================================
+# =========================
 # ADMIN ADD TASK
-# =========================================================
+# =========================
 
-async def admin_add_task(
+async def addtask(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1315,17 +1319,16 @@ async def admin_add_task(
     if len(context.args) < 3:
 
         await update.message.reply_text(
-            "❗ Format:\n\n"
-            "/addtask REWARD TITLE DESCRIPTION\n\n"
-            "উদাহরণ:\n"
-            "/addtask 20 Facebook Follow Page"
+            "/addtask REWARD TITLE DESCRIPTION"
         )
 
         return
 
     try:
 
-        reward = float(context.args[0])
+        reward = float(
+            context.args[0]
+        )
 
     except ValueError:
 
@@ -1341,12 +1344,16 @@ async def admin_add_task(
         context.args[2:]
     )
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute("""
+    cursor = conn.execute("""
         INSERT INTO tasks
-        (title, description, reward, active)
+        (
+            title,
+            description,
+            reward,
+            active
+        )
         VALUES (?, ?, ?, 1)
     """, (
         title,
@@ -1354,24 +1361,26 @@ async def admin_add_task(
         reward
     ))
 
-    task_id = cur.lastrowid
+    task_id = cursor.lastrowid
 
     conn.commit()
     conn.close()
 
     await update.message.reply_text(
+
         "✅ TASK CREATED\n\n"
+
         f"🆔 Task ID: {task_id}\n"
         f"📌 Title: {title}\n"
         f"🎁 Reward: {reward:.2f} Points"
     )
 
 
-# =========================================================
+# =========================
 # ADMIN PENDING WITHDRAWALS
-# =========================================================
+# =========================
 
-async def admin_pending_withdrawals(
+async def pending(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1384,18 +1393,15 @@ async def admin_pending_withdrawals(
 
         return
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute("""
-        SELECT id, user_id, amount, method, account
+    rows = conn.execute("""
+        SELECT *
         FROM withdrawals
         WHERE status='Pending'
         ORDER BY id DESC
-        LIMIT 20
-    """)
-
-    rows = cur.fetchall()
+        LIMIT 30
+    """).fetchall()
 
     conn.close()
 
@@ -1417,18 +1423,18 @@ async def admin_pending_withdrawals(
             f"💰 Amount: {row['amount']}\n"
             f"💳 Method: {row['method']}\n"
             f"📱 Account: {row['account']}\n\n"
-            f"Approve: /approve {row['id']}\n"
-            f"Reject: /reject {row['id']}\n\n"
+            f"✅ /approve {row['id']}\n"
+            f"❌ /reject {row['id']}\n\n"
         )
 
     await update.message.reply_text(text)
 
 
-# =========================================================
-# ADMIN APPROVE WITHDRAWAL
-# =========================================================
+# =========================
+# ADMIN APPROVE
+# =========================
 
-async def admin_approve(
+async def approve(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1451,7 +1457,9 @@ async def admin_approve(
 
     try:
 
-        withdrawal_id = int(context.args[0])
+        withdrawal_id = int(
+            context.args[0]
+        )
 
     except ValueError:
 
@@ -1461,18 +1469,15 @@ async def admin_approve(
 
         return
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute("""
-        SELECT user_id, amount, status
+    row = conn.execute("""
+        SELECT *
         FROM withdrawals
         WHERE id=?
     """, (
         withdrawal_id,
-    ))
-
-    row = cur.fetchone()
+    )).fetchone()
 
     if not row:
 
@@ -1494,7 +1499,7 @@ async def admin_approve(
 
         return
 
-    cur.execute("""
+    conn.execute("""
         UPDATE withdrawals
         SET status='Approved'
         WHERE id=?
@@ -1506,17 +1511,21 @@ async def admin_approve(
     conn.close()
 
     await update.message.reply_text(
-        "✅ Withdrawal Approved.\n\n"
-        f"ID: {withdrawal_id}\n"
-        f"Amount: {row['amount']} Points"
+
+        "✅ WITHDRAWAL APPROVED\n\n"
+
+        f"🆔 ID: {withdrawal_id}\n"
+        f"💰 Amount: {row['amount']} Points\n"
+        f"💳 Method: {row['method']}\n"
+        f"📱 Account: {row['account']}"
     )
 
 
-# =========================================================
-# ADMIN REJECT WITHDRAWAL
-# =========================================================
+# =========================
+# ADMIN REJECT
+# =========================
 
-async def admin_reject(
+async def reject(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1539,7 +1548,9 @@ async def admin_reject(
 
     try:
 
-        withdrawal_id = int(context.args[0])
+        withdrawal_id = int(
+            context.args[0]
+        )
 
     except ValueError:
 
@@ -1549,18 +1560,15 @@ async def admin_reject(
 
         return
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute("""
-        SELECT user_id, amount, status
+    row = conn.execute("""
+        SELECT *
         FROM withdrawals
         WHERE id=?
     """, (
         withdrawal_id,
-    ))
-
-    row = cur.fetchone()
+    )).fetchone()
 
     if not row:
 
@@ -1582,17 +1590,16 @@ async def admin_reject(
 
         return
 
-    # Reject হলে Points ফেরত
-    cur.execute("""
+    conn.execute("""
         UPDATE users
-        SET balance = balance + ?
+        SET balance=balance+?
         WHERE user_id=?
     """, (
         row["amount"],
         row["user_id"]
     ))
 
-    cur.execute("""
+    conn.execute("""
         UPDATE withdrawals
         SET status='Rejected'
         WHERE id=?
@@ -1604,17 +1611,79 @@ async def admin_reject(
     conn.close()
 
     await update.message.reply_text(
-        "❌ Withdrawal Rejected.\n\n"
+
+        "❌ WITHDRAWAL REJECTED\n\n"
+
         f"ID: {withdrawal_id}\n"
         f"{row['amount']} Points User-এর Balance-এ ফেরত দেওয়া হয়েছে।"
     )
 
 
-# =========================================================
-# ADMIN APPROVE TASK
-# =========================================================
+# =========================
+# ADMIN PENDING TASKS
+# =========================
 
-async def admin_approve_task(
+async def pendingtasks(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not is_admin(update.effective_user.id):
+
+        await update.message.reply_text(
+            "❌ Admin only."
+        )
+
+        return
+
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT
+            ts.id,
+            ts.user_id,
+            t.title,
+            t.reward
+        FROM task_submissions ts
+
+        JOIN tasks t
+        ON t.id=ts.task_id
+
+        WHERE ts.status='Pending'
+
+        ORDER BY ts.id DESC
+    """).fetchall()
+
+    conn.close()
+
+    if not rows:
+
+        await update.message.reply_text(
+            "📋 কোনো Pending Task নেই।"
+        )
+
+        return
+
+    text = "📋 PENDING TASKS\n\n"
+
+    for row in rows:
+
+        text += (
+            f"🆔 Submission: {row['id']}\n"
+            f"👤 User: {row['user_id']}\n"
+            f"📌 Task: {row['title']}\n"
+            f"🎁 Reward: {row['reward']}\n"
+            f"✅ /approvetask {row['id']}\n\n"
+        )
+
+    await update.message.reply_text(text)
+
+
+# =========================
+# ADMIN APPROVE TASK
+# =========================
+
+async def approvetask(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1637,7 +1706,9 @@ async def admin_approve_task(
 
     try:
 
-        submission_id = int(context.args[0])
+        submission_id = int(
+            context.args[0]
+        )
 
     except ValueError:
 
@@ -1647,25 +1718,22 @@ async def admin_approve_task(
 
         return
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = db()
 
-    cur.execute("""
+    row = conn.execute("""
         SELECT
-            ts.user_id,
-            ts.task_id,
-            ts.status,
+            ts.*,
             t.reward,
             t.title
         FROM task_submissions ts
+
         JOIN tasks t
-        ON ts.task_id=t.id
+        ON t.id=ts.task_id
+
         WHERE ts.id=?
     """, (
         submission_id,
-    ))
-
-    row = cur.fetchone()
+    )).fetchone()
 
     if not row:
 
@@ -1682,12 +1750,12 @@ async def admin_approve_task(
         conn.close()
 
         await update.message.reply_text(
-            "⚠️ এই submission আর Pending নেই।"
+            "⚠️ Submission already processed."
         )
 
         return
 
-    cur.execute("""
+    conn.execute("""
         UPDATE users
         SET balance=balance+?
         WHERE user_id=?
@@ -1696,7 +1764,7 @@ async def admin_approve_task(
         row["user_id"]
     ))
 
-    cur.execute("""
+    conn.execute("""
         UPDATE task_submissions
         SET status='Approved'
         WHERE id=?
@@ -1708,78 +1776,19 @@ async def admin_approve_task(
     conn.close()
 
     await update.message.reply_text(
+
         "✅ TASK APPROVED\n\n"
+
         f"Submission: {submission_id}\n"
         f"Reward: +{row['reward']} Points"
     )
 
 
-# =========================================================
-# ADMIN PENDING TASKS
-# =========================================================
-
-async def admin_pending_tasks(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_admin(update.effective_user.id):
-
-        await update.message.reply_text(
-            "❌ Admin only."
-        )
-
-        return
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT
-            ts.id,
-            ts.user_id,
-            ts.task_id,
-            t.title,
-            t.reward
-        FROM task_submissions ts
-        JOIN tasks t
-        ON ts.task_id=t.id
-        WHERE ts.status='Pending'
-        ORDER BY ts.id DESC
-    """)
-
-    rows = cur.fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        await update.message.reply_text(
-            "📋 কোনো Pending Task নেই।"
-        )
-
-        return
-
-    text = "📋 PENDING TASKS\n\n"
-
-    for row in rows:
-
-        text += (
-            f"🆔 Submission: {row['id']}\n"
-            f"👤 User: {row['user_id']}\n"
-            f"📌 Task: {row['title']}\n"
-            f"🎁 Reward: {row['reward']}\n"
-            f"✅ Approve: /approvetask {row['id']}\n\n"
-        )
-
-    await update.message.reply_text(text)
-
-
-# =========================================================
+# =========================
 # ADMIN HELP
-# =========================================================
+# =========================
 
-async def admin_help(
+async def adminhelp(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1793,44 +1802,158 @@ async def admin_help(
         return
 
     await update.message.reply_text(
+
         "👨‍💻 ADMIN COMMANDS\n\n"
+
         "/adminstats\n"
         "/addtask REWARD TITLE DESCRIPTION\n"
         "/pending\n"
         "/approve ID\n"
         "/reject ID\n"
         "/pendingtasks\n"
-        "/approvetask ID\n\n"
-        "User ID দেখতে:\n"
-        "/myid"
+        "/approvetask ID"
     )
 
 
-# =========================================================
-# MAIN
-# =========================================================
+# =========================
+# COMMENT REPLY
+# =========================
+
+async def comment_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    if not update.message.text:
+        return
+
+    if update.message.text.startswith("/"):
+        return
+
+    bot = context.bot
+
+    me = await bot.get_me()
+
+    text = update.message.text.lower()
+
+    mentioned = False
+
+    if me.username:
+
+        if (
+            f"@{me.username.lower()}"
+            in text
+        ):
+            mentioned = True
+
+    replied_to_bot = False
+
+    if update.message.reply_to_message:
+
+        if update.message.reply_to_message.from_user:
+
+            if (
+                update.message.reply_to_message
+                .from_user.id
+                == me.id
+            ):
+                replied_to_bot = True
+
+    if mentioned or replied_to_bot:
+
+        await update.message.reply_text(
+            "🤖 EHAN EARN BOT\n\n"
+            "আপনার message পেয়েছি।\n\n"
+            "সাহায্যের জন্য /help লিখুন।"
+        )
+
+
+# =========================
+# BOT COMMAND MENU
+# =========================
 
 async def post_init(application):
 
     commands = [
 
-        BotCommand("start", "Start Bot"),
-        BotCommand("balance", "Check Balance"),
-        BotCommand("mining", "Mining"),
-        BotCommand("daily", "Daily Bonus"),
-        BotCommand("quiz", "Quiz"),
-        BotCommand("tasks", "Tasks"),
-        BotCommand("referral", "Referral"),
-        BotCommand("games", "Games"),
-        BotCommand("leaderboard", "Leaderboard"),
-        BotCommand("withdraw", "Withdrawal"),
-        BotCommand("myid", "My Telegram ID"),
-        BotCommand("rules", "Rules"),
-        BotCommand("help", "Help"),
+        BotCommand(
+            "start",
+            "Start Bot"
+        ),
+
+        BotCommand(
+            "balance",
+            "Check Balance"
+        ),
+
+        BotCommand(
+            "mining",
+            "Mining"
+        ),
+
+        BotCommand(
+            "daily",
+            "Daily Bonus"
+        ),
+
+        BotCommand(
+            "quiz",
+            "Quiz"
+        ),
+
+        BotCommand(
+            "tasks",
+            "Tasks"
+        ),
+
+        BotCommand(
+            "referral",
+            "Referral"
+        ),
+
+        BotCommand(
+            "games",
+            "Games"
+        ),
+
+        BotCommand(
+            "leaderboard",
+            "Leaderboard"
+        ),
+
+        BotCommand(
+            "withdraw",
+            "Withdraw"
+        ),
+
+        BotCommand(
+            "myid",
+            "My Telegram ID"
+        ),
+
+        BotCommand(
+            "rules",
+            "Rules"
+        ),
+
+        BotCommand(
+            "help",
+            "Help"
+        )
+
     ]
 
-    await application.bot.set_my_commands(commands)
+    await application.bot.set_my_commands(
+        commands
+    )
 
+
+# =========================
+# MAIN
+# =========================
 
 def main():
 
@@ -1843,11 +1966,11 @@ def main():
     init_db()
 
     threading.Thread(
-        target=start_web_server,
+        target=health_server,
         daemon=True
     ).start()
 
-    app = (
+    application = (
         Application
         .builder()
         .token(TOKEN)
@@ -1855,90 +1978,168 @@ def main():
         .build()
     )
 
-    # User commands
-    app.add_handler(
+    # USER COMMANDS
+
+    application.add_handler(
         CommandHandler("start", start)
     )
 
-    app.add_handler(
-        CommandHandler("balance", balance)
+    application.add_handler(
+        CommandHandler("balance", balance_command)
     )
 
-    app.add_handler(
-        CommandHandler("referral", referral)
-    )
-
-    app.add_handler(
+    application.add_handler(
         CommandHandler("mining", mining)
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler("daily", daily)
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler("quiz", quiz)
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler("tasks", tasks)
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler("done", done_task)
     )
 
-    app.add_handler(
+    application.add_handler(
+        CommandHandler("referral", referral)
+    )
+
+    application.add_handler(
         CommandHandler("games", games)
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler("guess", guess)
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler("leaderboard", leaderboard)
     )
 
-    # Withdrawal
-    app.add_handler(
+    application.add_handler(
         CommandHandler("withdraw", withdraw)
     )
 
-    # Actual withdrawal request
-    app.add_handler(
-        CommandHandler("requestwithdraw", create_withdrawal)
-    )
-
-    app.add_handler(
-        CommandHandler("myid", myid)
-    )
-
-    app.add_handler(
-        CommandHandler("rules", rules)
-    )
-
-    app.add_handler(
-        CommandHandler("help", help_command)
-    )
-
-    # Quiz buttons
-    app.add_handler(
-        CallbackQueryHandler(
-            quiz_answer,
-            pattern=r"^quiz_[0-3]$"
+    application.add_handler(
+        CommandHandler(
+            "requestwithdraw",
+            request_withdraw
         )
     )
 
-    # Admin
-    app.add_handler(
-        CommandHandler("adminstats", admin_stats)
+    application.add_handler(
+        CommandHandler("myid", myid)
     )
 
-    app.add_handler(
-        CommandHandler("adminhelp", admin_help)
+    application.add_handler(
+        CommandHandler("rules", rules)
     )
 
-    app.add_handler(
-        CommandHandler("addtask", admin_add_task)
+    application.add_handler(
+        CommandHandler("help", help_command)
     )
+
+    # QUIZ BUTTON
+
+    application.add_handler(
+        CallbackQueryHandler(
+            quiz_answer,
+            pattern=r"^quiz:[0-3]$"
+        )
+    )
+
+    # WITHDRAW BUTTON
+
+    application.add_handler(
+        CallbackQueryHandler(
+            withdrawal_method,
+            pattern=r"^wd:(Binance|bKash|Nagad|PayPal)$"
+        )
+    )
+
+    # ADMIN
+
+    application.add_handler(
+        CommandHandler(
+            "adminstats",
+            adminstats
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "addtask",
+            addtask
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "pending",
+            pending
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "approve",
+            approve
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "reject",
+            reject
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "pendingtasks",
+            pendingtasks
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "approvetask",
+            approvetask
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "adminhelp",
+            adminhelp
+        )
+    )
+
+    # COMMENTS / MENTIONS
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            comment_reply
+        )
+    )
+
+    print(
+        "🚀 EHAN EARN BOT is starting..."
+    )
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+
+if __name__ == "__main__":
+    main()
